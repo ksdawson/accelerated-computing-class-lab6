@@ -29,7 +29,60 @@ constexpr int32_t mma_size_k = 8;
 // Part 2: Tensor Core Warm-Up Exercise
 
 __global__ void mma_16x8x8_kernel(float const *a, float const *b, float *c) {
-    // TODO: your GPU code here (using inline PTX)
+    // Rearrange data into expected format
+    // A
+    const uint32_t a_idx_x = (threadIdx.x % 4) + (threadIdx.x / 4) * 8; // j + i * w + offset
+    const uint32_t a_idx_y = (threadIdx.x % 4) + (threadIdx.x / 4) * 8 + 64;
+    const uint32_t a_idx_z = (threadIdx.x % 4) + (threadIdx.x / 4) * 8 + 4;
+    const uint32_t a_idx_w = (threadIdx.x % 4) + (threadIdx.x / 4) * 8 + 68;
+    float4 A = {a[a_idx_x], a[a_idx_y], a[a_idx_z], a[a_idx_w]};
+    // B
+    const uint32_t b_idx_x = (threadIdx.x % 4) * 8 + (threadIdx.x / 4);
+    const uint32_t b_idx_y = (threadIdx.x % 4) * 8 + (threadIdx.x / 4) + 32;
+    float2 B = {b[b_idx_x], b[b_idx_y]};
+    // C
+    const uint32_t c_idx_x = threadIdx.x * 2;
+    const uint32_t c_idx_y = threadIdx.x * 2 + 1;
+    const uint32_t c_idx_z = threadIdx.x * 2 + 64;
+    const uint32_t c_idx_w = threadIdx.x * 2 + 65;
+    float4 C = {c[c_idx_x], c[c_idx_y], c[c_idx_z], c[c_idx_w]};
+
+    // Convert float registers to int registers
+    uint32_t a0 = __float_as_uint(A.x);
+    uint32_t a1 = __float_as_uint(A.y);
+    uint32_t a2 = __float_as_uint(A.z);
+    uint32_t a3 = __float_as_uint(A.w);
+    uint32_t b0 = __float_as_uint(B.x);
+    uint32_t b1 = __float_as_uint(B.y);
+    uint32_t c0 = __float_as_uint(C.x);
+    uint32_t c1 = __float_as_uint(C.y);
+    uint32_t c2 = __float_as_uint(C.z);
+    uint32_t c3 = __float_as_uint(C.w);
+
+    // Call tensor core instruction using PTX
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3},  /* D matrix */ "
+        "{%4, %5, %6, %7},  /* A matrix */ "
+        "{%8, %9},          /* B matrix */ "
+        "{%0, %1, %2, %3};" /* C matrix */
+        // Outputs (read-write)
+        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+        // Inputs (read-only)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+    );
+
+    // Convert back
+    C.x = __uint_as_float(c0);
+    C.y = __uint_as_float(c1);
+    C.z = __uint_as_float(c2);
+    C.w = __uint_as_float(c3);
+
+    // Write back result to c rearranged
+    c[c_idx_x] = C.x;
+    c[c_idx_y] = C.y;
+    c[c_idx_z] = C.z;
+    c[c_idx_w] = C.w;
 }
 
 /// <--- /your code here --->
