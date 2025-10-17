@@ -501,67 +501,83 @@ __device__ uint32_t local_idx_to_global(uint32_t idx, uint32_t GW) {
 
 // Functions to rearrange A and B for vector loads
 template <uint32_t NW, uint32_t SMEM_TH, uint32_t SMEM_TW>
-__device__ void rearrange_a_m16n8k8(float *a) {
+__device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
     // Thread block info
     const uint32_t warp = threadIdx.x / 32;
     const uint32_t thread = threadIdx.x % 32;
-
     // Warp grid dimensions
     constexpr uint32_t wt_per_i = SMEM_TH / 16;
     constexpr uint32_t wt_per_j = SMEM_TW / 8;
     constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
-
     // Iterate over warp tiles
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
         const uint32_t warp_idx = warp + idx * NW;
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
-
         // Move buffer
         float *wa = a + wt_i * 16 * SMEM_TW + wt_j * 8;
-
         // Scalar load
         const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8);
         const uint32_t a_idx_y = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 64);
         const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 4);
         const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 68);
         float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
-
-        // Vector store (threads in a warp are synchronized so no explicit sync needed)
+        // Store in tmp array
+        tmp[idx] = A;
+    }
+    // Wait for everything to be loaded into registers
+    __syncthreads();
+    // Now write back
+    for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
+        // Warp tile indices
+        const uint32_t warp_idx = warp + idx * NW;
+        const uint32_t wt_i = warp_idx / wt_per_j;
+        const uint32_t wt_j = warp_idx % wt_per_j;
+        // Move buffer
+        float *wa = a + wt_i * 16 * SMEM_TW + wt_j * 8;
+        // Vector store
         float4 *wa4 = reinterpret_cast<float4*>(wa);
-        wa4[local_idx_to_global<2, SMEM_TW / 4>(thread)] = A;
+        wa4[local_idx_to_global<2, SMEM_TW / 4>(thread)] = tmp[idx];
     }
 }
 template <uint32_t NW, uint32_t SMEM_TH, uint32_t SMEM_TW>
-__device__ void rearrange_b_m16n8k8(float *b) {
+__device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
     // Thread block info
     const uint32_t warp = threadIdx.x / 32;
     const uint32_t thread = threadIdx.x % 32;
-
     // Warp grid dimensions
     constexpr uint32_t wt_per_i = SMEM_TH / 8;
     constexpr uint32_t wt_per_j = SMEM_TW / 8;
     constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
-
     // Iterate over warp tiles
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
         const uint32_t warp_idx = warp + idx * NW;
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
-
         // Move buffer
         float *wb = b + wt_i * 8 * SMEM_TW + wt_j * 8;
-
         // Scalar load
         const uint32_t b_idx_x = local_idx_to_global<8, SMEM_TW>((thread % 4) * 8 + (thread / 4));
         const uint32_t b_idx_y = local_idx_to_global<8, SMEM_TW>((thread % 4) * 8 + (thread / 4) + 32);
         float2 B = {wb[b_idx_x], wb[b_idx_y]};
-
-        // Vector store (threads in a warp are synchronized so no explicit sync needed)
+        // Store in tmp array
+        tmp[idx] = B;
+    }
+    // Wait for everything to be loaded into registers
+    __syncthreads();
+    // Now write back
+    for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
+        // Warp tile indices
+        const uint32_t warp_idx = warp + idx * NW;
+        const uint32_t wt_i = warp_idx / wt_per_j;
+        const uint32_t wt_j = warp_idx % wt_per_j;
+        // Move buffer
+        float *wb = b + wt_i * 8 * SMEM_TW + wt_j * 8;
+        // Vector store
         float2 *wb2 = reinterpret_cast<float2*>(wb);
-        wb2[local_idx_to_global<4, SMEM_TW / 2>(thread)] = B;
+        wb2[local_idx_to_global<4, SMEM_TW / 2>(thread)] = tmp[idx];
     }
 }
 
@@ -626,6 +642,16 @@ __device__ void matmul_tile(
     load_buffer(a, size_k, local_a, SMEM_TD, SM_TH * SMEM_TD);
     load_buffer(b, size_j, local_b, SM_TW, SMEM_TD * SM_TW);
 
+    // local_a tmp buffer
+    constexpr uint32_t num_threads = NW * 32;
+    constexpr uint32_t a_tmp_size = (SM_TH * SMEM_TD / num_threads) == 0 ? 1 : (SM_TH * SMEM_TD / num_threads);
+    float a_tmp_buffer[a_tmp_size];
+    float4 *a_tmp4 = reinterpret_cast<float4*>(a_tmp_buffer);
+    // local_b tmp buffer
+    constexpr uint32_t b_tmp_size = (SMEM_TD * SM_TW / num_threads) == 0 ? 1 : (SMEM_TD * SM_TW / num_threads);
+    float b_tmp_buffer[b_tmp_size];
+    float2 *b_tmp2 = reinterpret_cast<float2*>(b_tmp_buffer);
+
     // Iterate over SMEM tiles
     for (uint32_t smem_idx = 0; smem_idx < SM_TD / SMEM_TD - 1; ++smem_idx) {
         // Move global buffers to next SMEM tile
@@ -637,8 +663,8 @@ __device__ void matmul_tile(
         load_buffer_async(b, size_j, local_b_stage, SM_TW, SMEM_TD * SM_TW);
 
         // Rearrange local_a and local_b
-        rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
-        rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
+        rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a, a_tmp4);
+        rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b, b_tmp2);
         // Wait for every warp to finish since multiple warps will use the same warp tile
         __syncthreads();
         
@@ -673,8 +699,8 @@ __device__ void matmul_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
-    rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
-    rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
+    rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a, a_tmp4);
+    rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b, b_tmp2);
     __syncthreads();
     for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
         for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
