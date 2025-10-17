@@ -494,6 +494,10 @@ template <uint32_t LW, uint32_t GW>
 __device__ uint32_t local_idx_to_global(uint32_t idx) {
     return (idx / LW) * GW + (idx % LW);
 }
+template <uint32_t LW>
+__device__ uint32_t local_idx_to_global(uint32_t idx, uint32_t GW) {
+    return (idx / LW) * GW + (idx % LW);
+}
 
 // Functions to rearrange A and B for vector loads
 template <uint32_t SMEM_TW>
@@ -615,13 +619,14 @@ __device__ void matmul_tile(
     constexpr uint32_t wt_per_i = SM_TH / W_TH;
     constexpr uint32_t wt_per_j = SM_TW / W_TW;
     constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
+    const uint32_t warp = threadIdx.x / 32;
 
     // Accumulate c results in registers  
     float4 local_c[wt_per_w] = {0.0f};
 
     // Sync load first buffer
-    load_buffer(global_a, size_k, local_a, SMEM_TD, SM_TH * SMEM_TD);
-    load_buffer(global_b, size_j, local_b, SM_TW, SMEM_TD * SM_TW);
+    load_buffer(a, size_k, local_a, SMEM_TD, SM_TH * SMEM_TD);
+    load_buffer(b, size_j, local_b, SM_TW, SMEM_TD * SM_TW);
 
     // Iterate over SMEM tiles
     for (uint32_t smem_idx = 0; smem_idx < smemt_per_k - 1; ++smem_idx) {
@@ -640,7 +645,7 @@ __device__ void matmul_tile(
         __syncthreads();
         
         // Iterate over warp tiles
-        for (uint32_t warp_idx = threadIdx.x / 32; warp_idx < wt_per_i * wt_per_j; warp_idx += NW) {
+        for (uint32_t warp_idx = warp; warp_idx < wt_per_i * wt_per_j; warp_idx += NW) {
             // Warp tile indices
             const uint32_t wt_i = warp_idx / wt_per_j;
             const uint32_t wt_j = warp_idx % wt_per_j;
@@ -663,7 +668,7 @@ __device__ void matmul_tile(
     rearrange_a_m16n8k8<SMEM_TW>(local_a);
     rearrange_b_m16n8k8<SM_TW>(local_b);
     __syncthreads();
-    for (uint32_t warp_idx = threadIdx.x / 32; warp_idx < wt_per_i * wt_per_j; warp_idx += NW) {
+    for (uint32_t warp_idx = warp; warp_idx < wt_per_i * wt_per_j; warp_idx += NW) {
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
         float *wa = local_a + wt_i * W_TH * SMEM_TW + wt_j * W_TW;
@@ -672,19 +677,24 @@ __device__ void matmul_tile(
     }
 
     // Write back to memory
+    const uint32_t reduce_offset = size_k / SM_TD;
+    const uint32_t reduce_size_j = size_j * reduce_offset;
     for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
         // Warp tile indices
-        
+        const uint32_t warp_idx = warp * c_idx;
+        const uint32_t wt_i = warp_idx / wt_per_j;
+        const uint32_t wt_j = warp_idx % wt_per_j;
+        const uint32_t c_offset = wt_i * W_TH * reduce_size_j + wt_j * W_TW;
         // Local offset
-        const uint32_t c_idx_x = threadIdx.x * 2;
-        const uint32_t c_idx_y = threadIdx.x * 2 + 1;
-        const uint32_t c_idx_z = threadIdx.x * 2 + 64;
-        const uint32_t c_idx_w = threadIdx.x * 2 + 65;
-        //
-        c[c_idx_x] = local_c[c_idx].x;
-        c[c_idx_x] = local_c[c_idx].y;
-        c[c_idx_x] = local_c[c_idx].z;
-        c[c_idx_x] = local_c[c_idx].w;
+        const uint32_t c_idx_x = local_idx_to_global<W_TW>(threadIdx.x * 2, reduce_size_j);
+        const uint32_t c_idx_y = local_idx_to_global<W_TW>(threadIdx.x * 2 + 1, reduce_size_j);
+        const uint32_t c_idx_z = local_idx_to_global<W_TW>(threadIdx.x * 2 + 64, reduce_size_j);
+        const uint32_t c_idx_w = local_idx_to_global<W_TW>(threadIdx.x * 2 + 65, reduce_size_j);
+        // Scalar store to memory
+        c[c_offset + c_idx_x] = local_c[c_idx].x;
+        c[c_offset + c_idx_x] = local_c[c_idx].y;
+        c[c_offset + c_idx_x] = local_c[c_idx].z;
+        c[c_offset + c_idx_x] = local_c[c_idx].w;
     }
 
     // Make sure the whole tile is done before moving on
@@ -742,9 +752,90 @@ __global__ void matmul_tensor(
     }
 }
 
+template <uint32_t SM_TD, uint32_t V_SIZE>
+__launch_bounds__(1024)
+__global__ void matmul_reduce(
+    const uint32_t size_i, const uint32_t size_j, const uint32_t size_k,
+    float *c, const float *reduce_c
+) {
+    const uint32_t reduce_j_offset = size_k / SM_TD;
+    const uint32_t reduce_size_j   = size_j * reduce_j_offset;
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size_i * size_j; idx += gridDim.x * blockDim.x) {
+        // Load a c_ij array from GMEM
+        const uint32_t i = idx / size_j;
+        const uint32_t c_j = idx % size_j;
+        const uint32_t reduce_c_j = c_j * reduce_j_offset;
+        const float *base = &reduce_c[i * reduce_size_j + reduce_c_j];
+        float c_ij = 0.0f;
+        // Select the vector size
+        if constexpr (V_SIZE == 1) {
+            #pragma unroll
+            for (uint32_t k = 0; k < reduce_j_offset; ++k)
+                c_ij += base[k];
+        }
+        else if constexpr (V_SIZE == 2) {
+            const float2 *vptr = reinterpret_cast<const float2*>(base);
+            const uint32_t vecCount = reduce_j_offset / 2;
+            #pragma unroll
+            for (uint32_t vk = 0; vk < vecCount; ++vk) {
+                float2 v = vptr[vk];
+                c_ij += v.x + v.y;
+            }
+        }
+        else if constexpr (V_SIZE == 4) {
+            const float4 *vptr = reinterpret_cast<const float4*>(base);
+            const uint32_t vecCount = reduce_j_offset / 4;
+            #pragma unroll
+            for (uint32_t vk = 0; vk < vecCount; ++vk) {
+                float4 v = vptr[vk];
+                c_ij += v.x + v.y + v.z + v.w;
+            }
+        }
+        // Write back at the end
+        c[i * size_j + c_j] = c_ij;
+    }
+}
+
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
-    /* TODO: your CPU code here */
+    // return (size_t)size_i * (size_t)size_j * (size_t)(size_k / 512) * sizeof(float); // Uses the minimum TD
     return 0;
+}
+
+template <
+    uint32_t B, uint32_t W, uint32_t T, // Kernel dimensions
+    uint32_t SM_TH, uint32_t SM_TW, uint32_t SM_TD, uint32_t SMEM_TD, uint32_t W_TH, uint32_t W_TW, // Work dimensions
+    uint32_t V_SIZE = 1 // Reduce dimensions
+>
+void launch_specialized_kernel(
+    const int32_t size_i, const int32_t size_j, const int32_t size_k,
+    float const *a, float const *b, float *c, void *workspace) {
+    // Set dynamic shared memory size
+    // Add 1 pad to avoid bank conflicts? Is it added to height or width?
+    constexpr int shmem_size_bytes = (SM_TH * SMEM_TD + SMEM_TD * SM_TW) * 2 * sizeof(float);
+    cudaFuncSetAttribute(
+        matmul_tensor<W, SM_TH, SM_TW, SM_TD, SMEM_TD, W_TH, W_TW>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes
+    );
+    if (SM_TD == size_k) {
+        // No need to reduce
+        matmul_tensor<W, SM_TH, SM_TW, SM_TD, SMEM_TD, W_TH, W_TW><<<B, W*T, shmem_size_bytes>>>(
+            size_i, size_j, size_k, a, b, c
+        );
+        return;
+    } else {
+        matmul_tensor<W, SM_TH, SM_TW, SM_TD, SMEM_TD, W_TH, W_TW><<<B, W*T, shmem_size_bytes>>>(
+            size_i, size_j, size_k, a, b, (float*)workspace
+        );
+        matmul_reduce<SM_TD, V_SIZE><<<B, 32*T>>>(
+            size_i, size_j, size_k,
+            c, (float*)workspace
+        );
+        // matmul_reduce_vec<SM_TD, V_SIZE><<<B, 32*T>>>(
+        //     size_i, size_j, size_k,
+        //     c, (float*)workspace
+        // );
+    }
 }
 
 void launch_matmul_tensor(
@@ -756,7 +847,61 @@ void launch_matmul_tensor(
     float *c,       /* pointer to GPU memory */
     void *workspace /* pointer to GPU memory */
 ) {
-    /* TODO: your CPU code here */
+    // Thread block dimensions
+    constexpr uint32_t B = 48;
+    constexpr uint32_t W = 8; // Tuning parameter
+    constexpr uint32_t T = 32;
+
+    // Warp tile dimensions
+    constexpr uint32_t W_TH = 16;
+    constexpr uint32_t W_W = 8;
+
+    // SM tile dimensions
+    constexpr uint32_t SM_TH = W/2 * W_TH; // Tuning parameter
+    constexpr uint32_t SM_TW = T * W_TW; // Tuning parameter
+    constexpr uint32_t SM_TD = 3072; // Constant for these problem sizes
+
+    // SMEM tile dimensions
+    constexpr uint32_t SMEM_TD = 1 * 32; // Tuning parameter
+
+    if (size_i == 3072 || size_i == 2048 || size_i == 1024 || size_i == 512 || size_i == 256) {
+        launch_specialized_kernel<
+            B, W, T,
+            SM_TH, SM_TW, SM_TD, // 64, 256, 3072
+            SMEM_TD, // 32
+            W_TH, W_TW // 16, 8
+        >(size_i, size_j, size_k, a, b, c, workspace);
+    } else if (size_i == 128) {
+        launch_specialized_kernel<
+            B, W, T,
+            SM_TH/2, SM_TW, SM_TD, // 32, 256, 3072
+            SMEM_TD, // 32
+            W_TH, W_TW // 16, 8
+        >(size_i, size_j, size_k, a, b, c, workspace);
+    } else if (size_i == 64) {
+        launch_specialized_kernel<
+            B, W, T,
+            SM_TH/2, SM_TW/2, SM_TD, // 32, 128, 3072
+            SMEM_TD, // 32
+            W_TH, W_TW // 16, 8
+        >(size_i, size_j, size_k, a, b, c, workspace);
+    } else if (size_i == 32) { 
+        launch_specialized_kernel<
+            B, W, T,
+            SM_TH/4, SM_TW/2, SM_TD, // 16, 128, 3072
+            SMEM_TD, // 32
+            W_TH, W_TW // 16, 8
+        >(size_i, size_j, size_k, a, b, c, workspace);
+    } else if (size_i == 16) {
+        launch_specialized_kernel<
+            B, W, T,
+            SM_TH/4, SM_TW/4, SM_TD, // 16, 64, 3072
+            SMEM_TD, // 32
+            W_TH, W_TW // 16, 8
+        >(size_i, size_j, size_k, a, b, c, workspace);
+    } else {
+        return;
+    }
 }
 
 }; // namespace matmul_tensor
