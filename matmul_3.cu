@@ -619,7 +619,7 @@ __device__ void matmul_tile(
     const uint32_t warp = threadIdx.x / 32;
     const uint32_t thread = threadIdx.x % 32;
 
-    // Accumulate c results in registers  
+    // Accumulate c results in registers
     float4 local_c[wt_per_w] = {0.0f};
 
     // Sync load first buffer
@@ -642,25 +642,28 @@ __device__ void matmul_tile(
         // Wait for every warp to finish since multiple warps will use the same warp tile
         __syncthreads();
         
-        // Iterate over warp tiles
-        for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
-            // Warp tile indices
-            const uint32_t warp_idx = warp + c_idx * NW;
-            const uint32_t wt_i = warp_idx / wt_per_j;
-            const uint32_t wt_j = warp_idx % wt_per_j;
+        // Iterate along k dimension
+        for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
+            // Iterate over warp tiles
+            for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
+                // Warp tile indices
+                const uint32_t warp_idx = warp + c_idx * NW;
+                const uint32_t wt_i = warp_idx / wt_per_j;
+                const uint32_t wt_j = warp_idx % wt_per_j;
 
-            // Move buffers to warp tile
-            float *wa = local_a + wt_i * W_TH * SMEM_TD;
-            float *wb = local_b + wt_j * W_TW;
+                // Move buffers to warp tile
+                float *wa = local_a + wt_i * W_TH * SMEM_TD + k * W_TW;
+                float *wb = local_b + k * W_TW * SM_TW + wt_j * W_TW;
 
-            // Vector load A, B from SMEM
-            float4 *wa4 = reinterpret_cast<float4*>(wa);
-            float2 *wb2 = reinterpret_cast<float2*>(wb);
-            float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-            float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
+                // Vector load A, B from SMEM
+                float4 *wa4 = reinterpret_cast<float4*>(wa);
+                float2 *wb2 = reinterpret_cast<float2*>(wb);
+                float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
+                float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
 
-            // Call tensor core function
-            mma_16x8x8(A, B, &local_c[c_idx]);
+                // Call tensor core function
+                mma_16x8x8(A, B, &local_c[c_idx]);
+            }
         }
 
         // Swap double buffers
@@ -673,17 +676,19 @@ __device__ void matmul_tile(
     rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
     rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
     __syncthreads();
-    for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
-        const uint32_t warp_idx = warp + c_idx * NW;
-        const uint32_t wt_i = warp_idx / wt_per_j;
-        const uint32_t wt_j = warp_idx % wt_per_j;
-        float *wa = local_a + wt_i * W_TH * SMEM_TD;
-        float *wb = local_b + wt_j * W_TW;
-        float4 *wa4 = reinterpret_cast<float4*>(wa);
-        float2 *wb2 = reinterpret_cast<float2*>(wb);
-        float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-        float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
-        mma_16x8x8(A, B, &local_c[c_idx]);
+    for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
+        for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
+            const uint32_t warp_idx = warp + c_idx * NW;
+            const uint32_t wt_i = warp_idx / wt_per_j;
+            const uint32_t wt_j = warp_idx % wt_per_j;
+            float *wa = local_a + wt_i * W_TH * SMEM_TD + k * W_TW;
+            float *wb = local_b + k * W_TW * SM_TW + wt_j * W_TW;
+            float4 *wa4 = reinterpret_cast<float4*>(wa);
+            float2 *wb2 = reinterpret_cast<float2*>(wb);
+            float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
+            float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
+            mma_16x8x8(A, B, &local_c[c_idx]);
+        }
     }
 
     // Write back to memory
