@@ -560,14 +560,7 @@ __device__ void rearrange_b_m16n8k8(float *b) {
 }
 
 // Tensor core functions
-template <uint32_t SMEM_TW>
-__device__ void mma_16x8x8(float *a, float *b, float4 *c) {
-    // Vector load A, B from SMEM
-    float4 *a4 = reinterpret_cast<float4*>(a);
-    float2 *b2 = reinterpret_cast<float2*>(b);
-    float4 A = a4[local_idx_to_global<2, SMEM_TW / 4>(threadIdx.x)];
-    float2 B = b2[local_idx_to_global<4, SMEM_TW / 2>(threadIdx.x)];
-
+__device__ void mma_16x8x8(float4 A, float2 B, float4 *C) {
     // Convert float registers to int registers
     uint32_t ax = __float_as_uint(A.x);
     uint32_t ay = __float_as_uint(A.y);
@@ -575,10 +568,10 @@ __device__ void mma_16x8x8(float *a, float *b, float4 *c) {
     uint32_t aw = __float_as_uint(A.w);
     uint32_t bx = __float_as_uint(B.x);
     uint32_t by = __float_as_uint(B.y);
-    uint32_t cx = __float_as_uint(c[0].x);
-    uint32_t cy = __float_as_uint(c[0].y);
-    uint32_t cz = __float_as_uint(c[0].z);
-    uint32_t cw = __float_as_uint(c[0].w);
+    uint32_t cx = __float_as_uint((*C).x);
+    uint32_t cy = __float_as_uint((*C).y);
+    uint32_t cz = __float_as_uint((*C).z);
+    uint32_t cw = __float_as_uint((*C).w);
 
     // Call tensor core instruction using PTX
     asm volatile(
@@ -593,11 +586,11 @@ __device__ void mma_16x8x8(float *a, float *b, float4 *c) {
         : "r"(ax), "r"(ay), "r"(az), "r"(aw), "r"(bx), "r"(by)
     );
 
-    // Convert back and write back result to c rearranged
-    c[0].x = __uint_as_float(cx);
-    c[0].y = __uint_as_float(cy);
-    c[0].z = __uint_as_float(cz);
-    c[0].w = __uint_as_float(cw);
+    // Convert back and write back result to C rearranged
+    (*C).x = __uint_as_float(cx);
+    (*C).y = __uint_as_float(cy);
+    (*C).z = __uint_as_float(cz);
+    (*C).w = __uint_as_float(cw);
 }
 
 template <
@@ -615,7 +608,10 @@ __device__ void matmul_tile(
     constexpr uint32_t wt_per_i = SM_TH / W_TH;
     constexpr uint32_t wt_per_j = SM_TW / W_TW;
     constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
+
+    // Thread block info
     const uint32_t warp = threadIdx.x / 32;
+    const uint32_t thread = threadIdx.x % 32;
 
     // Accumulate c results in registers  
     float4 local_c[wt_per_w] = {0.0f};
@@ -635,10 +631,10 @@ __device__ void matmul_tile(
         load_buffer_async(b, size_j, local_b_stage, SM_TW, SMEM_TD * SM_TW);
 
         // Rearrange local_a and local_b
-        rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
-        rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
+        // rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
+        // rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
         // Wait for every warp to finish since multiple warps will use the same warp tile
-        __syncthreads();
+        // __syncthreads();
         
         // Iterate over warp tiles
         for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
@@ -651,8 +647,14 @@ __device__ void matmul_tile(
             float *wa = local_a + wt_i * W_TH * SMEM_TD;
             float *wb = local_b + wt_j * W_TW;
 
+            // Vector load A, B from SMEM
+            float4 *wa4 = reinterpret_cast<float4*>(wa);
+            float2 *wb2 = reinterpret_cast<float2*>(wb);
+            float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
+            float2 B = wb2[local_idx_to_global<4, SMEM_TD / 2>(thread)];
+
             // Call tensor core function
-            mma_16x8x8<SMEM_TD>(wa, wb, &local_c[c_idx]);
+            mma_16x8x8(A, B, &local_c[c_idx]);
         }
 
         // Swap double buffers
@@ -662,16 +664,20 @@ __device__ void matmul_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
-    rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
-    rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
-    __syncthreads();
+    // rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
+    // rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
+    // __syncthreads();
     for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
         const uint32_t warp_idx = warp + c_idx * NW;
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
         float *wa = local_a + wt_i * W_TH * SMEM_TD;
         float *wb = local_b + wt_j * W_TW;
-        mma_16x8x8<SMEM_TD>(wa, wb, &local_c[c_idx]);
+        float4 *wa4 = reinterpret_cast<float4*>(wa);
+        float2 *wb2 = reinterpret_cast<float2*>(wb);
+        float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
+        float2 B = wb2[local_idx_to_global<4, SMEM_TD / 2>(thread)];
+        mma_16x8x8(A, B, &local_c[c_idx]);
     }
 
     // Write back to memory
@@ -679,20 +685,31 @@ __device__ void matmul_tile(
     const uint32_t reduce_size_j = size_j * reduce_offset;
     for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
         // Warp tile indices
-        const uint32_t warp_idx = warp * c_idx;
+        const uint32_t warp_idx = warp + c_idx * NW;
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
-        const uint32_t c_offset = wt_i * W_TH * reduce_size_j + wt_j * W_TW * reduce_offset;
+        // Global offset
+        const uint32_t start_i = wt_i * W_TH;
+        const uint32_t start_j = wt_j * W_TW;
         // Local offset
-        const uint32_t c_idx_x = local_idx_to_global<W_TW>(threadIdx.x * 2, reduce_size_j);
-        const uint32_t c_idx_y = local_idx_to_global<W_TW>(threadIdx.x * 2 + 1, reduce_size_j);
-        const uint32_t c_idx_z = local_idx_to_global<W_TW>(threadIdx.x * 2 + 64, reduce_size_j);
-        const uint32_t c_idx_w = local_idx_to_global<W_TW>(threadIdx.x * 2 + 65, reduce_size_j);
+        const uint32_t cx_idx = thread * 2;
+        const uint32_t cy_idx = thread * 2 + 1;
+        const uint32_t cz_idx = thread * 2 + 64;
+        const uint32_t cw_idx = thread * 2 + 65;
+        // Convert to i,j
+        const uint32_t cx_i = start_i + cx_idx / W_TW;
+        const uint32_t cx_j = start_j + cx_idx % W_TW;
+        const uint32_t cy_i = start_i + cy_idx / W_TW;
+        const uint32_t cy_j = start_j + cy_idx % W_TW;
+        const uint32_t cz_i = start_i + cz_idx / W_TW;
+        const uint32_t cz_j = start_j + cz_idx % W_TW;
+        const uint32_t cw_i = start_i + cw_idx / W_TW;
+        const uint32_t cw_j = start_j + cw_idx % W_TW;
         // Scalar store to memory
-        c[c_offset + c_idx_x] = local_c[c_idx].x;
-        c[c_offset + c_idx_y] = local_c[c_idx].y;
-        c[c_offset + c_idx_z] = local_c[c_idx].z;
-        c[c_offset + c_idx_w] = local_c[c_idx].w;
+        c[cx_i * reduce_size_j + cx_j * reduce_offset] = local_c[c_idx].x;
+        c[cy_i * reduce_size_j + cy_j * reduce_offset] = local_c[c_idx].y;
+        c[cz_i * reduce_size_j + cz_j * reduce_offset] = local_c[c_idx].z;
+        c[cw_i * reduce_size_j + cw_j * reduce_offset] = local_c[c_idx].w;
     }
 
     // Make sure the whole tile is done before moving on
