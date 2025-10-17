@@ -509,12 +509,14 @@ __device__ void rearrange_a_m16n8k8(float *a) {
     // Warp grid dimensions
     constexpr uint32_t wt_per_i = SMEM_TH / 16;
     constexpr uint32_t wt_per_j = SMEM_TW / 8;
+    constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
 
     // Iterate over warp tiles
-    for (uint32_t idx = warp; idx < wt_per_i * wt_per_j; idx += NW) {
+    for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
-        const uint32_t wt_i = idx / wt_per_j;
-        const uint32_t wt_j = idx % wt_per_j;
+        const uint32_t warp_idx = warp + idx * NW;
+        const uint32_t wt_i = warp_idx / wt_per_j;
+        const uint32_t wt_j = warp_idx % wt_per_j;
 
         // Move buffer
         float *wa = a + wt_i * 16 * SMEM_TW + wt_j * 8;
@@ -540,12 +542,14 @@ __device__ void rearrange_b_m16n8k8(float *b) {
     // Warp grid dimensions
     constexpr uint32_t wt_per_i = SMEM_TH / 8;
     constexpr uint32_t wt_per_j = SMEM_TW / 8;
+    constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
 
     // Iterate over warp tiles
-    for (uint32_t idx = warp; idx < wt_per_i * wt_per_j; idx += NW) {
+    for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
-        const uint32_t wt_i = idx / wt_per_j;
-        const uint32_t wt_j = idx % wt_per_j;
+        const uint32_t warp_idx = warp + idx * NW;
+        const uint32_t wt_i = warp_idx / wt_per_j;
+        const uint32_t wt_j = warp_idx % wt_per_j;
 
         // Move buffer
         float *wb = b + wt_i * 8 * SMEM_TW + wt_j * 8;
@@ -559,7 +563,7 @@ __device__ void rearrange_b_m16n8k8(float *b) {
         float2 *wb2 = reinterpret_cast<float2*>(wb);
         wb2[local_idx_to_global<4, SMEM_TW / 2>(thread)] = B;
     }
-}cd 
+}
 
 // Tensor core functions
 __device__ void mma_16x8x8(float4 A, float2 B, float4 *C) {
@@ -653,7 +657,7 @@ __device__ void matmul_tile(
             float4 *wa4 = reinterpret_cast<float4*>(wa);
             float2 *wb2 = reinterpret_cast<float2*>(wb);
             float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-            float2 B = wb2[local_idx_to_global<4, SMEM_TD / 2>(thread)];
+            float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
 
             // Call tensor core function
             mma_16x8x8(A, B, &local_c[c_idx]);
@@ -678,7 +682,7 @@ __device__ void matmul_tile(
         float4 *wa4 = reinterpret_cast<float4*>(wa);
         float2 *wb2 = reinterpret_cast<float2*>(wb);
         float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-        float2 B = wb2[local_idx_to_global<4, SMEM_TD / 2>(thread)];
+        float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
         mma_16x8x8(A, B, &local_c[c_idx]);
     }
 
