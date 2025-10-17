@@ -489,7 +489,207 @@ void launch_matmul_improved_reduce(
 
 namespace matmul_tensor {
 
-/* TODO: your GPU kernels here... */
+// Helper functions
+template <uint32_t LW, uint32_t GW>
+__device__ uint32_t local_idx_to_global(uint32_t idx) {
+    return (idx / LW) * GW + (idx % LW);
+}
+
+// Functions to rearrange A and B for vector loads
+template <uint32_t SMEM_TH, uint32_t SMEM_TW>
+__device__ void rearrange_a_m16n8k8(float *a) {
+    // Warp info
+    const uint32_t warps = blockDim.x / 32;
+    const uint32_t warp_idx = threadIdx.x / 32;
+
+    // Warp grid dimensions
+    constexpr uint32_t wt_per_i = SMEM_TH / 16;
+    constexpr uint32_t wt_per_j = SMEM_TW / 8;
+
+    // Iterate over warp tiles
+    for (uint32_t idx = warp_idx; idx < wt_per_i * wt_per_j; idx += warps) {
+        // Warp tile indices
+        const uint32_t wt_i = idx / wt_per_j;
+        const uint32_t wt_j = idx % wt_per_j;
+
+        // Move buffer
+        float *wa = a + wt_i * 16 * SMEM_TW + wt_j * 8;
+        float4 *wa4 = reinterpret_cast<float4*>(wa);
+
+        // Scalar load
+        const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) + (threadIdx.x / 4) * 8);
+        const uint32_t a_idx_y = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) + (threadIdx.x / 4) * 8 + 64);
+        const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) + (threadIdx.x / 4) * 8 + 4);
+        const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) + (threadIdx.x / 4) * 8 + 68);
+        float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
+
+        // Vector store (threads in a warp are synchronized so no explicit sync needed)
+        wa4[local_idx_to_global<4, SMEM_TW / 4>(threadIdx.x)] = A;
+    }
+}
+template <uint32_t SMEM_TH, uint32_t SMEM_TW>
+__device__ void rearrange_b_m16n8k8(float *b) {
+    // Warp info
+    const uint32_t warps = blockDim.x / 32;
+    const uint32_t warp_idx = threadIdx.x / 32;
+
+    // Warp grid dimensions
+    constexpr uint32_t wt_per_i = SMEM_TH / 8;
+    constexpr uint32_t wt_per_j = SMEM_TW / 8;
+
+    // Iterate over warp tiles
+    for (uint32_t idx = warp_idx; idx < wt_per_i * wt_per_j; idx += warps) {
+        // Warp tile indices
+        const uint32_t wt_i = idx / wt_per_j;
+        const uint32_t wt_j = idx % wt_per_j;
+
+        // Move buffer
+        float *wb = b + wt_i * 8 * SMEM_TW + wt_j * 8;
+        float2 *wb2 = reinterpret_cast<float2*>(wb);
+
+        // Scalar load
+        const uint32_t b_idx_x = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) * 8 + (threadIdx.x / 4));
+        const uint32_t b_idx_y = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) * 8 + (threadIdx.x / 4) + 32);
+        float2 B = {wb[b_idx_x], wb[b_idx_y]};
+
+        // Vector store (threads in a warp are synchronized so no explicit sync needed)
+        wb4[local_idx_to_global<2, SMEM_TW / 2>(threadIdx.x)] = B;
+    }
+}
+
+// Tensor core functions
+template <uint32_t SMEM_TW>
+__device__ void mma_16x8x8(float *a, float *b, float *c) {
+    // Vector load A, B from SMEM
+    float4 *a4 = reinterpret_cast<float4*>(a);
+    float4 *b2 = reinterpret_cast<float2*>(b);
+    float4 A = a4[local_idx_to_global<4, SMEM_TW / 4>(threadIdx.x)];
+    float2 B = b2[local_idx_to_global<2, SMEM_TW / 2>(threadIdx.x)];
+    
+    // C is in registers
+    const uint32_t c_idx_x = threadIdx.x * 2;
+    const uint32_t c_idx_y = threadIdx.x * 2 + 1;
+    const uint32_t c_idx_z = threadIdx.x * 2 + 64;
+    const uint32_t c_idx_w = threadIdx.x * 2 + 65;
+    float4 C = {c[c_idx_x], c[c_idx_y], c[c_idx_z], c[c_idx_w]};
+
+    // Convert float registers to int registers
+    uint32_t a0 = __float_as_uint(A.x);
+    uint32_t a1 = __float_as_uint(A.y);
+    uint32_t a2 = __float_as_uint(A.z);
+    uint32_t a3 = __float_as_uint(A.w);
+    uint32_t b0 = __float_as_uint(B.x);
+    uint32_t b1 = __float_as_uint(B.y);
+    uint32_t c0 = __float_as_uint(C.x);
+    uint32_t c1 = __float_as_uint(C.y);
+    uint32_t c2 = __float_as_uint(C.z);
+    uint32_t c3 = __float_as_uint(C.w);
+
+    // Call tensor core instruction using PTX
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3},  /* D matrix */ "
+        "{%4, %5, %6, %7},  /* A matrix */ "
+        "{%8, %9},          /* B matrix */ "
+        "{%0, %1, %2, %3};" /* C matrix */
+        // Outputs (read-write)
+        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+        // Inputs (read-only)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+    );
+
+    // Convert back
+    C.x = __uint_as_float(c0);
+    C.y = __uint_as_float(c1);
+    C.z = __uint_as_float(c2);
+    C.w = __uint_as_float(c3);
+
+    // Write back result to c rearranged
+    c[c_idx_x] = C.x;
+    c[c_idx_y] = C.y;
+    c[c_idx_z] = C.z;
+    c[c_idx_w] = C.w;
+}
+
+template <
+    uint32_t SM_TH, uint32_t SM_TW, uint32_t SM_TD, // SM tile size
+    uint32_t SMEM_TD, // SMEM tile size
+    uint32_t W_TH = 16, uint32_t W_TW = 8 // Warp tile size
+>
+__launch_bounds__((SM_TH*SM_TW)/(W_TH*W_TW)*32)
+__global__ void matmul_tensor(
+    const int32_t size_i, const int32_t size_j, const int32_t size_k,
+    float const *a,  float const *b, float *c
+) {
+    // Setup the block's SRAM
+    extern __shared__ float sram[];
+    // Split the SRAM into a double buffer
+    constexpr uint32_t a_double_buffer_size = SM_TH * SMEM_TD;
+    constexpr uint32_t b_double_buffer_size = SMEM_TD * SM_TW;
+    float *local_a = sram;
+    float *local_a_stage = local_a + a_double_buffer_size;
+    float *local_b = local_a_stage + a_double_buffer_size;
+    float *local_b_stage = local_b + b_double_buffer_size;
+
+    // SM grid dimensions
+    const uint32_t smt_per_i = size_i / SM_TH;
+    const uint32_t smt_per_j = size_j / SM_TW;
+    const uint32_t smt_per_k = size_k / SM_TD;
+    // SMEM grid dimensions
+    constexpr uint32_t smemt_per_k = SM_TD / SMEM_TD;
+    // Warp grid dimensions
+    constexpr uint32_t wt_per_i = SM_TH / W_TH;
+    constexpr uint32_t wt_per_j = SM_TW / W_TW;
+
+    // Iterate over SM tiles
+    for (uint32_t sm_idx = blockIdx.x; sm_idx < smt_per_i * smt_per_j * smt_per_k; sm_idx += gridDim.x) {
+        // SM tile indices
+        const uint32_t smt_i = sm_idx / (smt_per_j * smt_per_k);
+        const uint32_t smt_j = (sm_idx % (smt_per_j * smt_per_k)) / smt_per_k;
+        const uint32_t smt_k = (sm_idx % (smt_per_j * smt_per_k)) % smt_per_k;
+
+        // Move global buffers to SM tile
+        float *global_a = a + smt_i * SM_TH * size_k + smt_k * SM_TD;
+        float *global_b = b + smt_k * SM_TD * size_j + smt_j * SM_TW;
+        float *global_c = c + smt_i * SM_TH * (size_j * (size_k / SM_TD)) + smt_j * SM_TW * (size_k / SM_TD) + smt_k;
+
+        // Accumulate c results in registers  
+        float4 local_c[wt_per_i * wt_per_j / NW] = {0.0f};
+
+        // Sync load first buffer
+        load_buffer(global_a, size_k, local_a, SMEM_TD, SM_TH * SMEM_TD);
+        load_buffer(global_b, size_j, local_b, SM_TW, SMEM_TD * SM_TW);
+
+        // Iterate over SMEM tiles
+        for (uint32_t smem_idx = 0; smem_idx < smemt_per_k; ++smem_idx) {
+            // Move global buffers to next SMEM tile
+            global_a += SMEM_TD;
+            global_b += SMEM_TD * size_j;
+
+            // Async load stage buffer
+            load_buffer_async(global_a, size_k, local_a_stage, SMEM_TD, SM_TH * SMEM_TD);
+            load_buffer_async(global_b, size_j, local_b_stage, SM_TW, SMEM_TD * SM_TW);
+
+            // Rearrange local_a and local_b
+            rearrange_a_m16n8k8<SMEM_TH, SMEM_TW>(local_a);
+            rearrange_b_m16n8k8<SMEM_TH, SMEM_TW>(local_b);
+            // Wait for every warp to finish since multiple warps will use the same warp tile
+            __syncthreads();
+            
+            // Iterate over warp tiles
+            for (uint32_t warp_idx = threadIdx.x / 32; warp_idx < wt_per_i * wt_per_j; warp_idx += blockDim.x / 32) {
+                // Warp tile indices
+                const uint32_t wt_i = warp_idx / wt_per_j;
+                const uint32_t wt_j = warp_idx % wt_per_j;
+
+                // TODO: move buffers
+
+                // Call tensor core function
+                mma_16x8x8<SMEM_TW>(a, b, local_c);
+            }
+        }
+    }
+}
 
 size_t get_workspace_size(int32_t size_i, int32_t size_j, int32_t size_k) {
     /* TODO: your CPU code here */
