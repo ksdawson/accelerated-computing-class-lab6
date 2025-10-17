@@ -527,10 +527,14 @@ __device__ void rearrange_a_m16n8k8(float *a) {
         const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 4);
         const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 68);
         float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
+        __syncthreads();
 
         // Vector store (threads in a warp are synchronized so no explicit sync needed)
+        const uint32_t i = thread / (SMEM_TW / 4);
+        const uint32_t j = (thread % (SMEM_TW / 4)) * 4;
+        wa += i * (SMEM_TW + 1) + j;
         float4 *wa4 = reinterpret_cast<float4*>(wa);
-        wa4[local_idx_to_global<2, SMEM_TW / 4>(thread)] = A;
+        *wa4 = A;
     }
 }
 template <uint32_t NW, uint32_t SMEM_TH, uint32_t SMEM_TW>
@@ -558,10 +562,14 @@ __device__ void rearrange_b_m16n8k8(float *b) {
         const uint32_t b_idx_x = local_idx_to_global<8, SMEM_TW>((thread % 4) * 8 + (thread / 4));
         const uint32_t b_idx_y = local_idx_to_global<8, SMEM_TW>((thread % 4) * 8 + (thread / 4) + 32);
         float2 B = {wb[b_idx_x], wb[b_idx_y]};
+        __syncthreads();
 
         // Vector store (threads in a warp are synchronized so no explicit sync needed)
+        const uint32_t i = thread / (SMEM_TW / 2);
+        const uint32_t j = (thread % (SMEM_TW / 2)) * 2;
+        wb += i * (SMEM_TW + 1) + j;
         float2 *wb2 = reinterpret_cast<float2*>(wb);
-        wb2[local_idx_to_global<4, SMEM_TW / 2>(thread)] = B;
+        *wb2 = B;
     }
 }
 
@@ -652,14 +660,21 @@ __device__ void matmul_tile(
                 const uint32_t wt_j = warp_idx % wt_per_j;
 
                 // Move buffers to warp tile
-                float *wa = local_a + wt_i * W_TH * SMEM_TD + k * W_TW;
-                float *wb = local_b + k * W_TW * SM_TW + wt_j * W_TW;
+                float *wa = local_a + wt_i * W_TH * (SMEM_TD + 1) + k * W_TW;
+                float *wb = local_b + k * W_TW * (SM_TW + 1) + wt_j * W_TW;
 
                 // Vector load A, B from SMEM
+                const uint32_t ai = thread / (SMEM_TD / 4);
+                const uint32_t aj = (thread % (SMEM_TD / 4)) * 4;
+                wa += ai * (SMEM_TD + 1) + aj;
                 float4 *wa4 = reinterpret_cast<float4*>(wa);
+                float4 A = *wa4;
+
+                const uint32_t bi = thread / (SM_TW / 2);
+                const uint32_t bj = (thread % (SM_TW / 2)) * 2;
+                wb += bi * (SM_TW + 1) + bj;
                 float2 *wb2 = reinterpret_cast<float2*>(wb);
-                float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-                float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
+                float2 B = *wb2;
 
                 // Call tensor core function
                 mma_16x8x8(A, B, &local_c[c_idx]);
@@ -677,16 +692,22 @@ __device__ void matmul_tile(
     rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
     __syncthreads();
     for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
-        for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
+                for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
             const uint32_t warp_idx = warp + c_idx * NW;
             const uint32_t wt_i = warp_idx / wt_per_j;
             const uint32_t wt_j = warp_idx % wt_per_j;
-            float *wa = local_a + wt_i * W_TH * SMEM_TD + k * W_TW;
-            float *wb = local_b + k * W_TW * SM_TW + wt_j * W_TW;
+            float *wa = local_a + wt_i * W_TH * (SMEM_TD + 1) + k * W_TW;
+            float *wb = local_b + k * W_TW * (SM_TW + 1) + wt_j * W_TW;
+            const uint32_t ai = thread / (SMEM_TD / 4);
+            const uint32_t aj = (thread % (SMEM_TD / 4)) * 4;
+            wa += ai * (SMEM_TD + 1) + aj;
             float4 *wa4 = reinterpret_cast<float4*>(wa);
+            float4 A = *wa4;
+            const uint32_t bi = thread / (SM_TW / 2);
+            const uint32_t bj = (thread % (SM_TW / 2)) * 2;
+            wb += bi * (SM_TW + 1) + bj;
             float2 *wb2 = reinterpret_cast<float2*>(wb);
-            float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-            float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
+            float2 B = *wb2;
             mma_16x8x8(A, B, &local_c[c_idx]);
         }
     }
@@ -746,8 +767,8 @@ __global__ void matmul_tensor(
     // Setup the block's SMEM
     extern __shared__ float sram[];
     // Split the SMEM into a double buffer
-    constexpr uint32_t a_double_buffer_size = SM_TH * SMEM_TD;
-    constexpr uint32_t b_double_buffer_size = SMEM_TD * SM_TW;
+    constexpr uint32_t a_double_buffer_size = SM_TH * (SMEM_TD + 1);
+    constexpr uint32_t b_double_buffer_size = SMEM_TD * (SM_TW + 1);
     float *smemt_a = sram;
     float *smemt_a_stage = smemt_a + a_double_buffer_size;
     float *smemt_b = smemt_a_stage + a_double_buffer_size;
@@ -837,7 +858,7 @@ void launch_specialized_kernel(
     float const *a, float const *b, float *c, void *workspace) {
     // Set dynamic shared memory size
     // Add 1 pad to avoid bank conflicts? Is it added to height or width?
-    constexpr int shmem_size_bytes = (SM_TH * SMEM_TD + SMEM_TD * SM_TW) * 2 * sizeof(float);
+    constexpr int shmem_size_bytes = (SM_TH * (SMEM_TD + 1) + SMEM_TD * (SM_TW + 1)) * 2 * sizeof(float);
     cudaFuncSetAttribute(
         matmul_tensor<W, SM_TH, SM_TW, SM_TD, SMEM_TD, W_TH, W_TW>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
