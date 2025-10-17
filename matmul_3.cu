@@ -517,7 +517,6 @@ __device__ void rearrange_a_m16n8k8(float *a) {
 
         // Move buffer
         float *wa = a + wt_i * 16 * SMEM_TW + wt_j * 8;
-        float4 *wa4 = reinterpret_cast<float4*>(wa);
 
         // Scalar load
         const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) + (threadIdx.x / 4) * 8);
@@ -527,7 +526,8 @@ __device__ void rearrange_a_m16n8k8(float *a) {
         float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
 
         // Vector store (threads in a warp are synchronized so no explicit sync needed)
-        wa4[local_idx_to_global<4, SMEM_TW / 4>(threadIdx.x)] = A;
+        float4 *wa4 = reinterpret_cast<float4*>(wa);
+        wa4[local_idx_to_global<2, SMEM_TW / 4>(threadIdx.x)] = A;
     }
 }
 template <uint32_t NW, uint32_t SMEM_TH, uint32_t SMEM_TW>
@@ -547,7 +547,6 @@ __device__ void rearrange_b_m16n8k8(float *b) {
 
         // Move buffer
         float *wb = b + wt_i * 8 * SMEM_TW + wt_j * 8;
-        float2 *wb2 = reinterpret_cast<float2*>(wb);
 
         // Scalar load
         const uint32_t b_idx_x = local_idx_to_global<8, SMEM_TW>((threadIdx.x % 4) * 8 + (threadIdx.x / 4));
@@ -555,7 +554,8 @@ __device__ void rearrange_b_m16n8k8(float *b) {
         float2 B = {wb[b_idx_x], wb[b_idx_y]};
 
         // Vector store (threads in a warp are synchronized so no explicit sync needed)
-        wb2[local_idx_to_global<2, SMEM_TW / 2>(threadIdx.x)] = B;
+        float2 *wb2 = reinterpret_cast<float2*>(wb);
+        wb2[local_idx_to_global<4, SMEM_TW / 2>(threadIdx.x)] = B;
     }
 }
 
@@ -565,8 +565,8 @@ __device__ void mma_16x8x8(float *a, float *b, float4 *c) {
     // Vector load A, B from SMEM
     float4 *a4 = reinterpret_cast<float4*>(a);
     float2 *b2 = reinterpret_cast<float2*>(b);
-    float4 A = a4[local_idx_to_global<4, SMEM_TW / 4>(threadIdx.x)];
-    float2 B = b2[local_idx_to_global<2, SMEM_TW / 2>(threadIdx.x)];
+    float4 A = a4[local_idx_to_global<2, SMEM_TW / 4>(threadIdx.x)];
+    float2 B = b2[local_idx_to_global<4, SMEM_TW / 2>(threadIdx.x)];
 
     // Convert float registers to int registers
     uint32_t ax = __float_as_uint(A.x);
@@ -611,8 +611,6 @@ __device__ void matmul_tile(
     float const *a, float const *b, float *c, // Matrices in GMEM
     float *local_a, float *local_b, float *local_a_stage, float *local_b_stage // Matrices in SMEM
 ) {
-    // SMEM grid dimensions
-    constexpr uint32_t smemt_per_k = SM_TD / SMEM_TD;
     // Warp grid dimensions
     constexpr uint32_t wt_per_i = SM_TH / W_TH;
     constexpr uint32_t wt_per_j = SM_TW / W_TW;
@@ -627,7 +625,7 @@ __device__ void matmul_tile(
     load_buffer(b, size_j, local_b, SM_TW, SMEM_TD * SM_TW);
 
     // Iterate over SMEM tiles
-    for (uint32_t smem_idx = 0; smem_idx < smemt_per_k - 1; ++smem_idx) {
+    for (uint32_t smem_idx = 0; smem_idx < SM_TD / SMEM_TD - 1; ++smem_idx) {
         // Move global buffers to next SMEM tile
         a += SMEM_TD;
         b += SMEM_TD * size_j;
