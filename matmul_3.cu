@@ -637,10 +637,10 @@ __device__ void matmul_tile(
         load_buffer_async(b, size_j, local_b_stage, SM_TW, SMEM_TD * SM_TW);
 
         // Rearrange local_a and local_b
-        // rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
-        // rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
-        // // Wait for every warp to finish since multiple warps will use the same warp tile
-        // __syncthreads();
+        rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
+        rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
+        // Wait for every warp to finish since multiple warps will use the same warp tile
+        __syncthreads();
         
         // Iterate along k dimension
         for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
@@ -656,20 +656,10 @@ __device__ void matmul_tile(
                 float *wb = local_b + k * W_TW * SM_TW + wt_j * W_TW;
 
                 // Vector load A, B from SMEM
-                // float4 *wa4 = reinterpret_cast<float4*>(wa);
-                // float2 *wb2 = reinterpret_cast<float2*>(wb);
-                // float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-                // float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
-
-                const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8);
-                const uint32_t a_idx_y = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8 + 64);
-                const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8 + 4);
-                const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8 + 68);
-                float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
-
-                const uint32_t b_idx_x = local_idx_to_global<8, SM_TW>((thread % 4) * 8 + (thread / 4));
-                const uint32_t b_idx_y = local_idx_to_global<8, SM_TW>((thread % 4) * 8 + (thread / 4) + 32);
-                float2 B = {wb[b_idx_x], wb[b_idx_y]};
+                float4 *wa4 = reinterpret_cast<float4*>(wa);
+                float2 *wb2 = reinterpret_cast<float2*>(wb);
+                float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
+                float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
 
                 // Call tensor core function
                 mma_16x8x8(A, B, &local_c[c_idx]);
@@ -683,9 +673,9 @@ __device__ void matmul_tile(
         std::swap(local_b, local_b_stage);
     }
     // Process last block
-    // rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
-    // rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
-    // __syncthreads();
+    rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a);
+    rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b);
+    __syncthreads();
     for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
         for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
             const uint32_t warp_idx = warp + c_idx * NW;
@@ -693,18 +683,10 @@ __device__ void matmul_tile(
             const uint32_t wt_j = warp_idx % wt_per_j;
             float *wa = local_a + wt_i * W_TH * SMEM_TD + k * W_TW;
             float *wb = local_b + k * W_TW * SM_TW + wt_j * W_TW;
-            // float4 *wa4 = reinterpret_cast<float4*>(wa);
-            // float2 *wb2 = reinterpret_cast<float2*>(wb);
-            // float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
-            // float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
-            const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8);
-            const uint32_t a_idx_y = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8 + 64);
-            const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8 + 4);
-            const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TD>((thread % 4) + (thread / 4) * 8 + 68);
-            float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
-            const uint32_t b_idx_x = local_idx_to_global<8, SM_TW>((thread % 4) * 8 + (thread / 4));
-            const uint32_t b_idx_y = local_idx_to_global<8, SM_TW>((thread % 4) * 8 + (thread / 4) + 32);
-            float2 B = {wb[b_idx_x], wb[b_idx_y]};
+            float4 *wa4 = reinterpret_cast<float4*>(wa);
+            float2 *wb2 = reinterpret_cast<float2*>(wb);
+            float4 A = wa4[local_idx_to_global<2, SMEM_TD / 4>(thread)];
+            float2 B = wb2[local_idx_to_global<4, SM_TW / 2>(thread)];
             mma_16x8x8(A, B, &local_c[c_idx]);
         }
     }
