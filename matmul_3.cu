@@ -542,6 +542,7 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
         // Vector store w/ padding
         *(reinterpret_cast<float4*>(wa)) = tmp[idx];
     }
+    __syncthreads();
 }
 template <uint32_t NW, uint32_t SMEM_TH, uint32_t SMEM_TW>
 __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
@@ -583,6 +584,7 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
         // Vector store w/ padding
         *(reinterpret_cast<float2*>(wb)) = tmp[idx];
     }
+    __syncthreads();
 }
 
 // Tensor core functions
@@ -646,15 +648,12 @@ __device__ void matmul_tile(
     load_buffer(a, size_k, local_a, SMEM_TD, SM_TH * SMEM_TD);
     load_buffer(b, size_j, local_b, SM_TW, SMEM_TD * SM_TW);
 
-    // local_a tmp buffer
+    // local tmp buffers
     constexpr uint32_t num_threads = NW * 32;
-    constexpr uint32_t a_tmp_size = (SM_TH * SMEM_TD / num_threads) == 0 ? 1 : (SM_TH * SMEM_TD / num_threads);
-    float a_tmp_buffer[a_tmp_size];
-    float4 *a_tmp4 = reinterpret_cast<float4*>(a_tmp_buffer);
-    // local_b tmp buffer
     constexpr uint32_t b_tmp_size = (SMEM_TD * SM_TW / num_threads) == 0 ? 1 : (SMEM_TD * SM_TW / num_threads);
     float b_tmp_buffer[b_tmp_size];
     float2 *b_tmp2 = reinterpret_cast<float2*>(b_tmp_buffer);
+    float4 *a_tmp4 = reinterpret_cast<float4*>(b_tmp_buffer); // reuse b
 
     // Thread offsets
     const uint32_t a_idx = local_idx_to_global<8, SMEM_TD + 4>(thread * 4);
@@ -673,8 +672,6 @@ __device__ void matmul_tile(
         // Rearrange local_a and local_b
         rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a, a_tmp4);
         rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b, b_tmp2);
-        // Wait for every warp to finish since multiple warps will use the same warp tile
-        __syncthreads();
         
         // Iterate along k dimension
         #pragma unroll
@@ -711,7 +708,6 @@ __device__ void matmul_tile(
     // Process last block
     rearrange_a_m16n8k8<NW, SM_TH, SMEM_TD>(local_a, a_tmp4);
     rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b, b_tmp2);
-    __syncthreads();
     #pragma unroll
     for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
         const uint32_t wa_offset = k * W_TW + a_idx;
