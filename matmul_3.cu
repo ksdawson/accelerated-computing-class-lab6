@@ -509,6 +509,12 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
     constexpr uint32_t wt_per_i = SMEM_TH / 16;
     constexpr uint32_t wt_per_j = SMEM_TW / 8;
     constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
+    // Thread offsets
+    const uint32_t load_offset = (thread % 4) + (thread / 4) * 8;
+    const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TW>(load_offset);
+    const uint32_t a_idx_y = local_idx_to_global<8, SMEM_TW>(load_offset + 64);
+    const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TW>(load_offset + 4);
+    const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TW>(load_offset + 68);
     // Iterate over warp tiles
     #pragma unroll
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
@@ -519,10 +525,6 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
         // Move buffer
         float *wa = a + wt_i * 16 * SMEM_TW + wt_j * 8;
         // Scalar load
-        const uint32_t a_idx_x = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8);
-        const uint32_t a_idx_y = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 64);
-        const uint32_t a_idx_z = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 4);
-        const uint32_t a_idx_w = local_idx_to_global<8, SMEM_TW>((thread % 4) + (thread / 4) * 8 + 68);
         const float4 A = {wa[a_idx_x], wa[a_idx_y], wa[a_idx_z], wa[a_idx_w]};
         // Store in tmp array
         tmp[idx] = A;
@@ -553,6 +555,10 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
     constexpr uint32_t wt_per_i = SMEM_TH / 8;
     constexpr uint32_t wt_per_j = SMEM_TW / 8;
     constexpr uint32_t wt_per_w = wt_per_i * wt_per_j / NW;
+    // Thread offsets
+    const uint32_t load_offset = (thread % 4) * 8 + (thread / 4);
+    const uint32_t b_idx_x = local_idx_to_global<8, SMEM_TW>(load_offset);
+    const uint32_t b_idx_y = local_idx_to_global<8, SMEM_TW>(load_offset + 32);
     // Iterate over warp tiles
     #pragma unroll
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
@@ -563,8 +569,6 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
         // Move buffer
         float *wb = b + wt_i * 8 * SMEM_TW + wt_j * 8;
         // Scalar load
-        const uint32_t b_idx_x = local_idx_to_global<8, SMEM_TW>((thread % 4) * 8 + (thread / 4));
-        const uint32_t b_idx_y = local_idx_to_global<8, SMEM_TW>((thread % 4) * 8 + (thread / 4) + 32);
         const float2 B = {wb[b_idx_x], wb[b_idx_y]};
         // Store in tmp array
         tmp[idx] = B;
@@ -650,10 +654,13 @@ __device__ void matmul_tile(
 
     // local tmp buffers
     constexpr uint32_t num_threads = NW * 32;
-    constexpr uint32_t b_tmp_size = (SMEM_TD * SM_TW / num_threads) == 0 ? 1 : (SMEM_TD * SM_TW / num_threads);
-    float b_tmp_buffer[b_tmp_size];
-    float2 *b_tmp2 = reinterpret_cast<float2*>(b_tmp_buffer);
-    float4 *a_tmp4 = reinterpret_cast<float4*>(b_tmp_buffer); // reuse b
+    constexpr uint32_t tmp_size = std::max(
+        (SMEM_TD * SM_TW / num_threads) == 0 ? 1 : (SMEM_TD * SM_TW / num_threads),
+        (SM_TH * SMEM_TD / num_threads) == 0 ? 1 : (SM_TH * SMEM_TD / num_threads)
+    );
+    float tmp_buffer[tmp_size];
+    float2 *b_tmp2 = reinterpret_cast<float2*>(tmp_buffer);
+    float4 *a_tmp4 = reinterpret_cast<float4*>(tmp_buffer);
 
     // Thread offsets
     const uint32_t a_idx = local_idx_to_global<8, SMEM_TD + 4>(thread * 4);
@@ -676,8 +683,8 @@ __device__ void matmul_tile(
         // Iterate along k dimension
         #pragma unroll
         for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
-            const uint32_t wa_offset = k * W_TW + a_idx;
-            const uint32_t wb_offset = k * W_TW * (SM_TW + 2) + b_idx;
+            float *wa_base = local_a + k * W_TW + a_idx;
+            float *wb_base = local_b + k * W_TW * (SM_TW + 2) + b_idx;
             // Iterate over warp tiles
             #pragma unroll
             for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
@@ -687,8 +694,8 @@ __device__ void matmul_tile(
                 const uint32_t wt_j = warp_idx % wt_per_j;
 
                 // Move buffers to warp tile
-                float *wa = local_a + wt_i * W_TH * (SMEM_TD + 4) + wa_offset;
-                float *wb = local_b + wb_offset + wt_j * W_TW;
+                float *wa = wa_base + wt_i * W_TH * (SMEM_TD + 4);
+                float *wb = wb_base + wt_j * W_TW;
 
                 // Vector load A, B from SMEM
                 const float4 A = *(reinterpret_cast<float4*>(wa));
@@ -710,15 +717,15 @@ __device__ void matmul_tile(
     rearrange_b_m16n8k8<NW, SMEM_TD, SM_TW>(local_b, b_tmp2);
     #pragma unroll
     for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
-        const uint32_t wa_offset = k * W_TW + a_idx;
-        const uint32_t wb_offset = k * W_TW * (SM_TW + 2) + b_idx;
+        float *wa_base = local_a + k * W_TW + a_idx;
+        float *wb_base = local_b + k * W_TW * (SM_TW + 2) + b_idx;
         #pragma unroll
         for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
             const uint32_t warp_idx = warp + c_idx * NW;
             const uint32_t wt_i = warp_idx / wt_per_j;
             const uint32_t wt_j = warp_idx % wt_per_j;
-            float *wa = local_a + wt_i * W_TH * (SMEM_TD + 4) + wa_offset;
-            float *wb = local_b + wb_offset + wt_j * W_TW;
+            float *wa = wa_base + wt_i * W_TH * (SMEM_TD + 4);
+            float *wb = wb_base + wt_j * W_TW;
             const float4 A = *(reinterpret_cast<float4*>(wa));
             const float2 B = *(reinterpret_cast<float2*>(wb));
             mma_16x8x8(A, B, &local_c[c_idx]);
