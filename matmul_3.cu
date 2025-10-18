@@ -530,6 +530,7 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
     // Wait for everything to be loaded into registers
     __syncthreads();
     // Now write back
+    const uint32_t a_idx = local_idx_to_global<8, SMEM_TW + 4>(thread * 4);
     #pragma unroll
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
@@ -537,12 +538,9 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
         // Move buffer
-        float *wa = a + wt_i * 16 * (SMEM_TW + 4) + wt_j * 8;
+        float *wa = a + wt_i * 16 * (SMEM_TW + 4) + wt_j * 8 + a_idx;
         // Vector store w/ padding
-        const uint32_t a_idx = local_idx_to_global<8, SMEM_TW + 4>(thread * 4);
-        wa += a_idx;
-        float4 *wa4 = reinterpret_cast<float4*>(wa);
-        *wa4 = tmp[idx];
+        *(reinterpret_cast<float4*>(wa)) = tmp[idx];
     }
 }
 template <uint32_t NW, uint32_t SMEM_TH, uint32_t SMEM_TW>
@@ -573,6 +571,7 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
     // Wait for everything to be loaded into registers
     __syncthreads();
     // Now write back
+    const uint32_t b_idx = local_idx_to_global<8, SMEM_TW + 2>(thread * 2);
     #pragma unroll
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
@@ -580,12 +579,9 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
         // Move buffer
-        float *wb = b + wt_i * 8 * (SMEM_TW + 2) + wt_j * 8;
+        float *wb = b + wt_i * 8 * (SMEM_TW + 2) + wt_j * 8 + b_idx;
         // Vector store w/ padding
-        const uint32_t b_idx = local_idx_to_global<8, SMEM_TW + 2>(thread * 2);
-        wb += b_idx;
-        float2 *wb2 = reinterpret_cast<float2*>(wb);
-        *wb2 = tmp[idx];
+        *(reinterpret_cast<float2*>(wb)) = tmp[idx];
     }
 }
 
