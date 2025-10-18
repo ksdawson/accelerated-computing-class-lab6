@@ -917,8 +917,8 @@ void launch_matmul_tensor(
     constexpr uint32_t W_TW = 8;
 
     // SM tile dimensions
-    constexpr uint32_t SM_TH = W/2 * W_TH; // Tuning parameter
-    constexpr uint32_t SM_TW = T * W_TW; // Tuning parameter
+    constexpr uint32_t SM_TH = W * W_TH; // Tuning parameter
+    constexpr uint32_t SM_TW = T/2 * W_TW; // Tuning parameter
     constexpr uint32_t SM_TD = 3072; // Constant for these problem sizes
 
     // SMEM tile dimensions
@@ -927,7 +927,7 @@ void launch_matmul_tensor(
     if (size_i == 3072 || size_i == 2048 || size_i == 1024 || size_i == 512 || size_i == 256) {
         launch_specialized_kernel<
             B, W, T,
-            SM_TH, SM_TW, SM_TD, // 64, 256, 3072
+            SM_TH, SM_TW, SM_TD, // 128, 128, 3072
             SMEM_TD, // 32
             W_TH, W_TW // 16, 8
         >(size_i, size_j, size_k, a, b, c, workspace);
