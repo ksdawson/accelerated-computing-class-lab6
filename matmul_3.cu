@@ -934,28 +934,28 @@ void launch_matmul_tensor(
     } else if (size_i == 128) {
         launch_specialized_kernel<
             B, W, T,
-            SM_TH/2, SM_TW, SM_TD, // 32, 256, 3072
+            SM_TH/2, SM_TW, SM_TD, // 64, 128, 3072
             SMEM_TD, // 32
             W_TH, W_TW // 16, 8
         >(size_i, size_j, size_k, a, b, c, workspace);
     } else if (size_i == 64) {
         launch_specialized_kernel<
             B, W, T,
-            SM_TH/2, SM_TW/2, SM_TD, // 32, 128, 3072
+            SM_TH/2, SM_TW/2, SM_TD, // 64, 64, 3072
             SMEM_TD, // 32
             W_TH, W_TW // 16, 8
         >(size_i, size_j, size_k, a, b, c, workspace);
     } else if (size_i == 32) { 
         launch_specialized_kernel<
             B, W, T,
-            SM_TH/4, SM_TW/2, SM_TD, // 16, 128, 3072
+            SM_TH/4, SM_TW/2, SM_TD, // 32, 64, 3072
             SMEM_TD, // 32
             W_TH, W_TW // 16, 8
         >(size_i, size_j, size_k, a, b, c, workspace);
     } else if (size_i == 16) {
         launch_specialized_kernel<
             B, W, T,
-            SM_TH/4, SM_TW/4, SM_TD, // 16, 64, 3072
+            SM_TH/8, SM_TW/2, SM_TD, // 16, 64, 3072
             SMEM_TD, // 32
             W_TH, W_TW // 16, 8
         >(size_i, size_j, size_k, a, b, c, workspace);
@@ -1351,14 +1351,14 @@ int main(int argc, char **argv) {
 
     auto configs = std::vector<BenchmarkConfig>{
         {3072, 3072, 3072},
-        // {2048, 3072, 3072},
-        // {1024, 3072, 3072},
-        // {512, 3072, 3072},
-        // {256, 3072, 3072},
-        // {128, 3072, 3072},
-        // {64, 3072, 3072},
-        // {32, 3072, 3072},
-        // {16, 3072, 3072},
+        {2048, 3072, 3072},
+        {1024, 3072, 3072},
+        {512, 3072, 3072},
+        {256, 3072, 3072},
+        {128, 3072, 3072},
+        {64, 3072, 3072},
+        {32, 3072, 3072},
+        {16, 3072, 3072},
     };
     auto data = read_test_data(test_data_dir, configs);
     run_all_impls(Phase::WARMUP, data, configs);
