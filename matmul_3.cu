@@ -532,7 +532,7 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
     // Wait for everything to be loaded into registers
     __syncthreads();
     // Now write back
-    const uint32_t a_idx = local_idx_to_global<8, SMEM_TW + 4>(thread * 4);
+    const uint32_t a_idx = local_idx_to_global<8, SMEM_TW + 8>(thread * 4);
     #pragma unroll
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
@@ -540,7 +540,7 @@ __device__ void rearrange_a_m16n8k8(float *a, float4 *tmp) {
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
         // Move buffer
-        float *wa = a + wt_i * 16 * (SMEM_TW + 4) + wt_j * 8 + a_idx;
+        float *wa = a + wt_i * 16 * (SMEM_TW + 8) + wt_j * 8 + a_idx;
         // Vector store w/ padding
         *(reinterpret_cast<float4*>(wa)) = tmp[idx];
     }
@@ -576,7 +576,7 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
     // Wait for everything to be loaded into registers
     __syncthreads();
     // Now write back
-    const uint32_t b_idx = local_idx_to_global<8, SMEM_TW + 2>(thread * 2);
+    const uint32_t b_idx = local_idx_to_global<8, SMEM_TW + 8>(thread * 2);
     #pragma unroll
     for (uint32_t idx = 0; idx < wt_per_w; ++idx) {
         // Warp tile indices
@@ -584,7 +584,7 @@ __device__ void rearrange_b_m16n8k8(float *b, float2 *tmp) {
         const uint32_t wt_i = warp_idx / wt_per_j;
         const uint32_t wt_j = warp_idx % wt_per_j;
         // Move buffer
-        float *wb = b + wt_i * 8 * (SMEM_TW + 2) + wt_j * 8 + b_idx;
+        float *wb = b + wt_i * 8 * (SMEM_TW + 8) + wt_j * 8 + b_idx;
         // Vector store w/ padding
         *(reinterpret_cast<float2*>(wb)) = tmp[idx];
     }
@@ -663,8 +663,8 @@ __device__ void matmul_tile(
     float4 *a_tmp4 = reinterpret_cast<float4*>(tmp_buffer);
 
     // Thread offsets
-    const uint32_t a_idx = local_idx_to_global<8, SMEM_TD + 4>(thread * 4);
-    const uint32_t b_idx = local_idx_to_global<8, SM_TW + 2>(thread * 2);
+    const uint32_t a_idx = local_idx_to_global<8, SMEM_TD + 8>(thread * 4);
+    const uint32_t b_idx = local_idx_to_global<8, SM_TW + 8>(thread * 2);
 
     // Iterate over SMEM tiles
     for (uint32_t smem_idx = 0; smem_idx < SM_TD / SMEM_TD - 1; ++smem_idx) {
@@ -684,7 +684,7 @@ __device__ void matmul_tile(
         #pragma unroll
         for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
             float *wa_base = local_a + k * W_TW + a_idx;
-            float *wb_base = local_b + k * W_TW * (SM_TW + 2) + b_idx;
+            float *wb_base = local_b + k * W_TW * (SM_TW + 8) + b_idx;
             // Iterate over warp tiles
             #pragma unroll
             for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
@@ -694,7 +694,7 @@ __device__ void matmul_tile(
                 const uint32_t wt_j = warp_idx % wt_per_j;
 
                 // Move buffers to warp tile
-                float *wa = wa_base + wt_i * W_TH * (SMEM_TD + 4);
+                float *wa = wa_base + wt_i * W_TH * (SMEM_TD + 8);
                 float *wb = wb_base + wt_j * W_TW;
 
                 // Vector load A, B from SMEM
@@ -718,13 +718,13 @@ __device__ void matmul_tile(
     #pragma unroll
     for (uint32_t k = 0; k < SMEM_TD / W_TW; ++k) {
         float *wa_base = local_a + k * W_TW + a_idx;
-        float *wb_base = local_b + k * W_TW * (SM_TW + 2) + b_idx;
+        float *wb_base = local_b + k * W_TW * (SM_TW + 8) + b_idx;
         #pragma unroll
         for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
             const uint32_t warp_idx = warp + c_idx * NW;
             const uint32_t wt_i = warp_idx / wt_per_j;
             const uint32_t wt_j = warp_idx % wt_per_j;
-            float *wa = wa_base + wt_i * W_TH * (SMEM_TD + 4);
+            float *wa = wa_base + wt_i * W_TH * (SMEM_TD + 8);
             float *wb = wb_base + wt_j * W_TW;
             const float4 A = *(reinterpret_cast<float4*>(wa));
             const float2 B = *(reinterpret_cast<float2*>(wb));
@@ -735,6 +735,10 @@ __device__ void matmul_tile(
     // Write back to memory
     const uint32_t reduce_offset = size_k / SM_TD;
     const uint32_t reduce_size_j = size_j * reduce_offset;
+    const uint32_t cx_idx = thread * 2;
+    const uint32_t cy_idx = thread * 2 + 1;
+    const uint32_t cz_idx = thread * 2 + 64;
+    const uint32_t cw_idx = thread * 2 + 65;
     #pragma unroll
     for (uint32_t c_idx = 0; c_idx < wt_per_w; ++c_idx) {
         // Warp tile indices
@@ -744,11 +748,6 @@ __device__ void matmul_tile(
         // Global offset
         const uint32_t start_i = wt_i * W_TH;
         const uint32_t start_j = wt_j * W_TW;
-        // Local offset
-        const uint32_t cx_idx = thread * 2;
-        const uint32_t cy_idx = thread * 2 + 1;
-        const uint32_t cz_idx = thread * 2 + 64;
-        const uint32_t cw_idx = thread * 2 + 65;
         // Convert to i,j
         const uint32_t cx_i = start_i + cx_idx / W_TW;
         const uint32_t cx_j = start_j + cx_idx % W_TW;
@@ -788,8 +787,8 @@ __global__ void matmul_tensor(
     // Setup the block's SMEM
     extern __shared__ float sram[];
     // Split the SMEM into a double buffer
-    constexpr uint32_t a_double_buffer_size = SM_TH * (SMEM_TD + 4);
-    constexpr uint32_t b_double_buffer_size = SMEM_TD * (SM_TW + 2);
+    constexpr uint32_t a_double_buffer_size = SM_TH * (SMEM_TD + 8);
+    constexpr uint32_t b_double_buffer_size = SMEM_TD * (SM_TW + 8);
     float *smemt_a = sram;
     float *smemt_a_stage = smemt_a + a_double_buffer_size;
     float *smemt_b = smemt_a_stage + a_double_buffer_size;
@@ -878,7 +877,7 @@ void launch_specialized_kernel(
     const int32_t size_i, const int32_t size_j, const int32_t size_k,
     float const *a, float const *b, float *c, void *workspace) {
     // Set dynamic shared memory size
-    constexpr int shmem_size_bytes = (SM_TH * (SMEM_TD + 4) + SMEM_TD * (SM_TW + 2)) * 2 * sizeof(float); // Padding to avoid bank conflicts
+    constexpr int shmem_size_bytes = (SM_TH * (SMEM_TD + 8) + SMEM_TD * (SM_TW + 8)) * 2 * sizeof(float); // Padding to avoid bank conflicts
     cudaFuncSetAttribute(
         matmul_tensor<W, SM_TH, SM_TW, SM_TD, SMEM_TD, W_TH, W_TW>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
