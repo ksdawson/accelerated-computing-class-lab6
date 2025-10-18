@@ -954,7 +954,7 @@ void launch_matmul_tensor(
         >(size_i, size_j, size_k, a, b, c, workspace);
     } else if (size_i == 16) {
         launch_specialized_kernel<
-            B, W, T,
+            B, W/2, T,
             SM_TH/8, SM_TW/2, SM_TD, // 16, 64, 3072
             SMEM_TD, // 32
             W_TH, W_TW // 16, 8
